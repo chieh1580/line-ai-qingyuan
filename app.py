@@ -22,7 +22,7 @@ logging_handler.setLevel("INFO")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "請填入密碼")
-BOSS_USER_ID = ""  # 填入老闆的 LINE User ID
+BOSS_USER_ID = "U139541a789ae55afa3c3d551e966d6fb"
 ADMIN_URL = os.environ.get("ADMIN_URL", "")
 
 paused_users = set()
