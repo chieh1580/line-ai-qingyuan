@@ -15,10 +15,6 @@ import json
 from datetime import datetime
 import sys
 
-try:
-    import psycopg2
-except ImportError:
-    psycopg2 = None
 
 app = Flask(__name__)
 app.logger.setLevel("INFO")
@@ -67,77 +63,37 @@ SYSTEM_PROMPT = """你是「小琪」，勤源青崧居的專業銷售顧問AI�
 3. 不確定的問題說「讓我幫您轉接專員確認，請問方便留下姓名和電話嗎？」
 4. 回覆簡潔，引導客人繼續聊"""
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+SETTINGS_FILE = "/data/settings.json"
 
 
-def get_db_connection():
-    if not DATABASE_URL or not psycopg2:
-        return None
+def _load_settings():
     try:
-        return psycopg2.connect(DATABASE_URL)
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return None
+        return {}
 
 
-def init_db():
-    conn = get_db_connection()
-    if not conn:
-        return
+def _save_settings(data):
     try:
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key VARCHAR(50) PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        cur.execute("SELECT key FROM settings WHERE key IN ('system_prompt', 'trigger_words')")
-        existing = {row[0] for row in cur.fetchall()}
-        if 'system_prompt' not in existing:
-            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s)", ('system_prompt', SYSTEM_PROMPT))
-        if 'trigger_words' not in existing:
-            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s)", ('trigger_words', json.dumps(TRIGGER_WORDS, ensure_ascii=False)))
-        conn.commit()
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
     except Exception as e:
-        print(f"[DB_INIT] Error: {e}", flush=True)
-    finally:
-        conn.close()
+        print(f"[SETTINGS] Save error: {e}", flush=True)
+        return False
 
 
 def get_setting(key, default=None):
-    conn = get_db_connection()
-    if not conn:
-        return default
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
-        row = cur.fetchone()
-        return row[0] if row else default
-    except Exception:
-        return default
-    finally:
-        conn.close()
+    data = _load_settings()
+    return data.get(key, default)
 
 
 def set_setting(key, value):
-    conn = get_db_connection()
-    if not conn:
-        return False
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO settings (key, value) VALUES (%s, %s)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """, (key, value))
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        conn.close()
-
-
-init_db()
+    data = _load_settings()
+    data[key] = value
+    return _save_settings(data)
 
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="zh-TW">
