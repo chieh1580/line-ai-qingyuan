@@ -14,6 +14,7 @@ import os
 import json
 from datetime import datetime
 import sys
+import threading
 
 
 app = Flask(__name__)
@@ -30,8 +31,13 @@ ADMIN_URL = os.environ.get("ADMIN_URL", "")
 paused_users = set()
 user_profiles = {}
 app_logs = []
+user_state = {}           # userId -> {"flow": "collecting_booking", "step": "name"}
+user_booking_data = {}    # userId -> {"name": ..., "phone": ..., "time": ...}
+user_message_count = {}   # userId -> int (追蹤互動次數，用於觸發見證卡片)
+testimonial_sent = set()  # 已發送見證卡片的用戶
 
-TRIGGER_WORDS = ["找真人","找人工","找客服","找專員","真人","人工","我想了解","我想購買","預約看屋","我要看房"]
+TRIGGER_WORDS = ["找真人","找人工","找客服","找專員","真人","人工"]
+BOOKING_KEYWORDS = ["我要預約", "我想預約", "預約看屋", "我要看房", "我想看房", "預約賞屋", "我想預約看屋"]
 
 SYSTEM_PROMPT = """你是「小琪」，勤源青崧居的專業銷售顧問AI。語氣親切專業。
 
@@ -362,6 +368,288 @@ function resetSettings() {
 </html>"""
 
 
+# ===== LINE API 通用函式 =====
+def reply_messages(reply_token, messages):
+    requests.post(
+        "https://api.line.me/v2/bot/message/reply",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_TOKEN}"},
+        json={"replyToken": reply_token, "messages": messages},
+        timeout=10
+    )
+
+
+def push_messages(user_id, messages):
+    r = requests.post(
+        "https://api.line.me/v2/bot/message/push",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_TOKEN}"},
+        json={"to": user_id, "messages": messages},
+        timeout=10
+    )
+    log_msg = f"[PUSH] to={user_id[-6:]} status={r.status_code}"
+    print(log_msg, flush=True)
+    app_logs.append({"time": datetime.now().strftime("%m/%d %H:%M:%S"), "msg": log_msg})
+    return r
+
+
+def push_text(user_id, text):
+    push_messages(user_id, [{"type": "text", "text": text}])
+
+
+def push_flex(user_id, flex):
+    push_messages(user_id, [flex])
+
+
+# ===== Flex Message 建構 =====
+def build_welcome_flex():
+    """Follow 歡迎卡片 — 房地產版"""
+    return {
+        "type": "flex",
+        "altText": "歡迎加入勤源青崧居！",
+        "contents": {
+            "type": "bubble",
+            "size": "giga",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": "🏠 歡迎來到勤源青崧居", "weight": "bold", "size": "lg", "color": "#1a5c2e"},
+                    {"type": "text", "text": "龍潭收租金雞母，醫護剛需首選 💰", "size": "md", "margin": "sm", "color": "#555555"}
+                ],
+                "paddingAll": "20px", "backgroundColor": "#f0f7f2"
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": "我是您的專屬賞屋顧問「小琪」🙋‍♀️\n有任何問題都可以問我，也可以直接點選下方按鈕快速了解！", "wrap": True, "size": "sm", "color": "#666666"},
+                    {"type": "separator", "margin": "lg"},
+                    {"type": "text", "text": "👇 您想了解什麼呢？", "weight": "bold", "size": "md", "margin": "lg", "color": "#2d1f14"},
+                    {
+                        "type": "box", "layout": "horizontal", "spacing": "sm", "margin": "md",
+                        "contents": [
+                            {"type": "button", "action": {"type": "message", "label": "🏠 房型與價格", "text": "你們有哪些房型？價格怎麼算？"}, "style": "primary", "color": "#1a5c2e", "height": "sm"},
+                            {"type": "button", "action": {"type": "message", "label": "📍 地段優勢", "text": "這個建案的地段有什麼優勢？"}, "style": "primary", "color": "#2e7d4a", "height": "sm"}
+                        ]
+                    },
+                    {
+                        "type": "box", "layout": "horizontal", "spacing": "sm", "margin": "sm",
+                        "contents": [
+                            {"type": "button", "action": {"type": "message", "label": "💰 投資報酬", "text": "投資報酬率大概多少？適合投資嗎？"}, "style": "primary", "color": "#3d8b5e", "height": "sm"},
+                            {"type": "button", "action": {"type": "message", "label": "📅 預約看屋", "text": "我想預約看屋"}, "style": "primary", "color": "#c8401a", "height": "sm"}
+                        ]
+                    },
+                    {"type": "separator", "margin": "lg"},
+                    {"type": "text", "text": "💡 也可以直接打字問我任何問題哦！", "wrap": True, "size": "xs", "color": "#999999", "margin": "lg"}
+                ],
+                "paddingAll": "20px"
+            }
+        }
+    }
+
+
+def build_booking_start_flex():
+    """預約看屋 — 第一步：詢問姓名"""
+    return {
+        "type": "flex",
+        "altText": "太好了！幫您安排預約看屋",
+        "contents": {
+            "type": "bubble",
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": "太好了！🎉", "weight": "bold", "size": "lg", "color": "#1a5c2e"},
+                    {"type": "text", "text": "讓我幫您安排賞屋，只需要簡單 3 個資訊：", "wrap": True, "size": "sm", "color": "#666666", "margin": "md"},
+                    {"type": "separator", "margin": "lg"},
+                    {"type": "text", "text": "① 請問您怎麼稱呼？", "weight": "bold", "size": "md", "margin": "lg", "color": "#2d1f14"},
+                    {"type": "text", "text": "直接打字回覆就好囉 ✏️", "size": "xs", "color": "#999999", "margin": "sm"}
+                ],
+                "paddingAll": "20px"
+            }
+        }
+    }
+
+
+def build_booking_complete_flex(data):
+    """預約看屋 — 完成確認卡片"""
+    return {
+        "type": "flex",
+        "altText": "預約資料收到囉！",
+        "contents": {
+            "type": "bubble",
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": "預約資料收到囉！✅", "weight": "bold", "size": "lg", "color": "#1a5c2e"},
+                    {"type": "separator", "margin": "lg"},
+                    {"type": "box", "layout": "horizontal", "margin": "lg", "contents": [
+                        {"type": "text", "text": "姓名", "size": "sm", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": data.get("name", ""), "size": "sm", "weight": "bold", "flex": 4}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+                        {"type": "text", "text": "電話", "size": "sm", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": data.get("phone", ""), "size": "sm", "weight": "bold", "flex": 4}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+                        {"type": "text", "text": "方便時間", "size": "sm", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": data.get("time", ""), "size": "sm", "weight": "bold", "flex": 4}
+                    ]},
+                    {"type": "separator", "margin": "lg"},
+                    {"type": "text", "text": "林小姐會盡快透過電話或 LINE 與您確認賞屋時間，請留意來電 📱", "wrap": True, "size": "sm", "color": "#666666", "margin": "lg"}
+                ],
+                "paddingAll": "20px"
+            }
+        }
+    }
+
+
+def build_notify_boss_flex(customer_name, name, phone, preferred_time, time_str):
+    """通知老闆 Flex 卡片 — 新的預約看屋"""
+    return {
+        "type": "flex",
+        "altText": f"🔔 新的預約看屋：{name}",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "contents": [{"type": "text", "text": "🔔 新的預約看屋！", "weight": "bold", "size": "lg", "color": "#c8401a"}],
+                "paddingAll": "16px", "backgroundColor": "#FFF8F4"
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+                        {"type": "text", "text": "LINE 名稱", "size": "sm", "color": "#999999", "flex": 3},
+                        {"type": "text", "text": customer_name, "size": "sm", "weight": "bold", "flex": 5}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+                        {"type": "text", "text": "姓名", "size": "sm", "color": "#999999", "flex": 3},
+                        {"type": "text", "text": name or "未提供", "size": "sm", "weight": "bold", "flex": 5}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+                        {"type": "text", "text": "電話", "size": "sm", "color": "#999999", "flex": 3},
+                        {"type": "text", "text": phone or "未提供", "size": "sm", "weight": "bold", "flex": 5}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+                        {"type": "text", "text": "方便時間", "size": "sm", "color": "#999999", "flex": 3},
+                        {"type": "text", "text": preferred_time or "未提供", "size": "sm", "weight": "bold", "flex": 5}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+                        {"type": "text", "text": "提交時間", "size": "sm", "color": "#999999", "flex": 3},
+                        {"type": "text", "text": time_str, "size": "sm", "flex": 5}
+                    ]},
+                    {"type": "separator", "margin": "lg"},
+                    {"type": "button", "action": {"type": "uri", "label": "👉 查看後台", "uri": ADMIN_URL or "https://line-ai-qingyuan-production.up.railway.app/admin"}, "style": "primary", "color": "#c8401a", "margin": "lg", "height": "sm"}
+                ],
+                "paddingAll": "16px"
+            }
+        }
+    }
+
+
+def build_testimonial_flex():
+    """見證卡片 — 買家/租客心得"""
+    return {
+        "type": "flex",
+        "altText": "🏆 看看其他屋主怎麼說",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "contents": [{"type": "text", "text": "🏆 屋主真心分享", "weight": "bold", "size": "md", "color": "#2d1f14"}],
+                "paddingAll": "16px", "backgroundColor": "#f0f7f2"
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": "「當初看中離 804 醫院走路 3 分鐘，買來收租，第一個月就租出去了，租客是醫院護理師，穩定又安心！」", "wrap": True, "size": "sm", "color": "#555555", "style": "italic"},
+                    {"type": "text", "text": "— 單套房屋主 陳先生", "size": "xs", "color": "#999999", "margin": "md", "align": "end"},
+                    {"type": "separator", "margin": "lg"},
+                    {
+                        "type": "box", "layout": "horizontal", "margin": "lg",
+                        "contents": [
+                            {"type": "box", "layout": "vertical", "flex": 1, "contents": [
+                                {"type": "text", "text": "年報酬率", "size": "xs", "color": "#999999", "align": "center"},
+                                {"type": "text", "text": "3%↑", "size": "xl", "weight": "bold", "color": "#c8401a", "align": "center"}
+                            ]},
+                            {"type": "box", "layout": "vertical", "flex": 1, "contents": [
+                                {"type": "text", "text": "出租速度", "size": "xs", "color": "#999999", "align": "center"},
+                                {"type": "text", "text": "1個月", "size": "xl", "weight": "bold", "color": "#1a5c2e", "align": "center"}
+                            ]},
+                            {"type": "box", "layout": "vertical", "flex": 1, "contents": [
+                                {"type": "text", "text": "剩餘戶數", "size": "xs", "color": "#999999", "align": "center"},
+                                {"type": "text", "text": "倒數6戶", "size": "xl", "weight": "bold", "color": "#1a6bc8", "align": "center"}
+                            ]}
+                        ]
+                    },
+                    {"type": "separator", "margin": "lg"},
+                    {"type": "button", "action": {"type": "message", "label": "我也想了解 👋", "text": "我想預約看屋"}, "style": "primary", "color": "#1a5c2e", "margin": "lg", "height": "sm"}
+                ],
+                "paddingAll": "16px"
+            }
+        }
+    }
+
+
+# ===== 延遲推播跟進 =====
+def schedule_followups(user_id):
+    """加好友後排程 24hr / 48hr / 7天 自動跟進"""
+    followup_configs = [
+        (86400, "24hr"),
+        (172800, "48hr"),
+        (604800, "7day"),
+    ]
+    for delay, msg_type in followup_configs:
+        timer = threading.Timer(delay, send_followup, args=[user_id, msg_type])
+        timer.daemon = True
+        timer.start()
+
+
+def send_followup(user_id, msg_type):
+    # 如果已經預約過，不再跟進
+    if user_id in user_booking_data:
+        return
+
+    messages = {
+        "24hr": {
+            "type": "flex", "altText": "還沒來得及了解嗎？",
+            "contents": {"type": "bubble", "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": [
+                {"type": "text", "text": "嗨～還沒來得及了解嗎？👋", "weight": "bold", "size": "md", "color": "#2d1f14"},
+                {"type": "text", "text": "青崧居單套房 360 萬起，離 804 醫院走路 3 分鐘，買來收租超划算！\n\n試著問我任何問題，3 秒就有答案 😊", "wrap": True, "size": "sm", "color": "#666666", "margin": "md"},
+                {"type": "button", "action": {"type": "message", "label": "看看房型與價格 💬", "text": "你們有哪些房型？價格怎麼算？"}, "style": "primary", "color": "#1a5c2e", "margin": "lg", "height": "sm"}
+            ]}}
+        },
+        "48hr": {
+            "type": "flex", "altText": "很多人最好奇的問題",
+            "contents": {"type": "bubble", "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": [
+                {"type": "text", "text": "很多人最好奇的是… 🤔", "weight": "bold", "size": "md", "color": "#2d1f14"},
+                {"type": "text", "text": "「自備款要多少？」\n「月繳負擔重嗎？」", "wrap": True, "size": "sm", "color": "#666666", "margin": "md"},
+                {"type": "text", "text": "單套房首購自備約 110 萬，月繳約 15,000 元，比繳房租還划算！而且租金收入還能 cover 一大半 💪", "wrap": True, "size": "sm", "color": "#555555", "margin": "md"},
+                {"type": "button", "action": {"type": "message", "label": "我想了解更多", "text": "投資報酬率大概多少？適合投資嗎？"}, "style": "primary", "color": "#1a5c2e", "margin": "lg", "height": "sm"}
+            ]}}
+        },
+        "7day": {
+            "type": "flex", "altText": "倒數戶數提醒",
+            "contents": {"type": "bubble", "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": [
+                {"type": "text", "text": "🏠 戶數倒數中！", "weight": "bold", "size": "md", "color": "#c8401a"},
+                {"type": "text", "text": "青崧居剩餘戶數不多囉！\n單套房剩 2 戶、雙套房剩 4 戶\n\n有興趣的話趕快來看看，錯過就沒了 🔥", "wrap": True, "size": "sm", "color": "#666666", "margin": "md"},
+                {"type": "button", "action": {"type": "message", "label": "立即預約看屋 📅", "text": "我想預約看屋"}, "style": "primary", "color": "#c8401a", "margin": "lg", "height": "sm"}
+            ]}}
+        }
+    }
+
+    msg = messages.get(msg_type)
+    if msg:
+        push_flex(user_id, msg)
+        log_msg = f"[FOLLOWUP] {msg_type} sent to {user_id[-6:]}"
+        print(log_msg, flush=True)
+        app_logs.append({"time": datetime.now().strftime("%m/%d %H:%M:%S"), "msg": log_msg})
+
+
+def notify_boss_booking(customer_name, name, phone, preferred_time):
+    """通知老闆：新的預約看屋"""
+    time_str = datetime.now().strftime("%m/%d %H:%M")
+    flex = build_notify_boss_flex(customer_name, name, phone, preferred_time, time_str)
+    push_flex(BOSS_USER_ID, flex)
+
+
 def get_line_profile(user_id):
     try:
         r = requests.get(
@@ -377,12 +665,7 @@ def get_line_profile(user_id):
 
 
 def reply_to_user(reply_token, message):
-    requests.post(
-        "https://api.line.me/v2/bot/message/reply",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_TOKEN}"},
-        json={"replyToken": reply_token, "messages": [{"type": "text", "text": message}]},
-        timeout=10
-    )
+    reply_messages(reply_token, [{"type": "text", "text": message}])
 
 
 def notify_boss(customer_name, message, time_str):
@@ -422,18 +705,42 @@ def webhook():
         return jsonify({"status": "ok"})
 
     for event in body["events"]:
-        if event.get("type") != "message":
+        event_type = event.get("type")
+
+        # ===== Follow Event：加好友歡迎卡片 =====
+        if event_type == "follow":
+            user_id = event["source"]["userId"]
+            reply_token = event["replyToken"]
+            log_msg = f"[FOLLOW] new follower: {user_id[-6:]}"
+            print(log_msg, flush=True)
+            app_logs.append({"time": datetime.now().strftime("%m/%d %H:%M:%S"), "msg": log_msg})
+
+            profile = get_line_profile(user_id)
+            user_profiles[user_id] = {
+                "name": profile.get("displayName", "用戶"),
+                "picture": profile.get("pictureUrl", ""),
+                "lastMessage": "（剛加好友）",
+                "lastTime": datetime.now().strftime("%m/%d %H:%M")
+            }
+
+            reply_messages(reply_token, [build_welcome_flex()])
+            schedule_followups(user_id)
+            continue
+
+        # ===== 只處理文字訊息 =====
+        if event_type != "message":
             continue
         if event["message"].get("type") != "text":
             continue
 
         user_id = event["source"]["userId"]
         reply_token = event["replyToken"]
-        user_message = event["message"]["text"]
-        log_msg = f"[WEBHOOK] userId={user_id} message={user_message}"
+        user_message = event["message"]["text"].strip()
+        log_msg = f"[MSG] {user_id[-6:]}: {user_message[:50]}"
         print(log_msg, flush=True)
         app_logs.append({"time": datetime.now().strftime("%m/%d %H:%M:%S"), "msg": log_msg})
 
+        # 更新用戶資料
         if user_id not in user_profiles:
             profile = get_line_profile(user_id)
             user_profiles[user_id] = {
@@ -446,9 +753,72 @@ def webhook():
             user_profiles[user_id]["lastMessage"] = user_message
             user_profiles[user_id]["lastTime"] = datetime.now().strftime("%m/%d %H:%M")
 
+        # ----- 1. 檢查：是否在預約看屋資料收集流程中 -----
+        if user_id in user_state and user_state[user_id].get("flow") == "collecting_booking":
+            step = user_state[user_id].get("step")
+
+            if step == "name":
+                user_booking_data.setdefault(user_id, {})
+                user_booking_data[user_id]["name"] = user_message
+                user_state[user_id]["step"] = "phone"
+                reply_messages(reply_token, [
+                    {"type": "flex", "altText": "請留下電話",
+                     "contents": {"type": "bubble", "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": [
+                         {"type": "text", "text": f"收到！{user_message} 您好 👍", "weight": "bold", "size": "md", "color": "#2d1f14"},
+                         {"type": "text", "text": "② 請留下您的聯絡電話", "weight": "bold", "size": "md", "margin": "lg", "color": "#2d1f14"},
+                         {"type": "text", "text": "方便林小姐跟您確認賞屋時間 📞", "size": "xs", "color": "#999999", "margin": "sm"}
+                     ]}}}
+                ])
+                continue
+
+            elif step == "phone":
+                user_booking_data.setdefault(user_id, {})
+                user_booking_data[user_id]["phone"] = user_message
+                user_state[user_id]["step"] = "time"
+                reply_messages(reply_token, [
+                    {"type": "flex", "altText": "請選擇方便時間",
+                     "contents": {"type": "bubble", "body": {"type": "box", "layout": "vertical", "paddingAll": "20px", "contents": [
+                         {"type": "text", "text": "③ 最後一題！您方便什麼時間來看屋呢？", "weight": "bold", "size": "md", "color": "#2d1f14"},
+                         {"type": "box", "layout": "vertical", "margin": "md", "spacing": "sm", "contents": [
+                             {"type": "button", "action": {"type": "message", "label": "平日白天（週一～五）", "text": "平日白天"}, "style": "secondary", "height": "sm"},
+                             {"type": "button", "action": {"type": "message", "label": "平日晚上（週一～五）", "text": "平日晚上"}, "style": "secondary", "height": "sm"},
+                             {"type": "button", "action": {"type": "message", "label": "週末（六日）", "text": "週末"}, "style": "secondary", "height": "sm"},
+                             {"type": "button", "action": {"type": "message", "label": "都可以，配合安排", "text": "都可以"}, "style": "secondary", "height": "sm"}
+                         ]}
+                     ]}}}
+                ])
+                continue
+
+            elif step == "time":
+                user_booking_data.setdefault(user_id, {})
+                user_booking_data[user_id]["time"] = user_message
+                del user_state[user_id]
+                customer_name = user_profiles.get(user_id, {}).get("name", "用戶")
+                data = user_booking_data[user_id]
+
+                # 通知老闆
+                notify_boss_booking(
+                    customer_name,
+                    data.get("name", ""),
+                    data.get("phone", ""),
+                    data.get("time", "")
+                )
+
+                reply_messages(reply_token, [build_booking_complete_flex(data)])
+                continue
+
+        # ----- 2. 檢查：預約看屋關鍵字 -----
+        if any(kw in user_message for kw in BOOKING_KEYWORDS):
+            user_state[user_id] = {"flow": "collecting_booking", "step": "name"}
+            user_booking_data[user_id] = {}
+            reply_messages(reply_token, [build_booking_start_flex()])
+            continue
+
+        # ----- 3. 檢查：暫停中的用戶 -----
         if user_id in paused_users:
             continue
 
+        # ----- 4. 檢查：找真人（暫停 AI） -----
         current_triggers = json.loads(get_setting('trigger_words', json.dumps(TRIGGER_WORDS)))
         if any(word in user_message for word in current_triggers):
             paused_users.add(user_id)
@@ -458,10 +828,23 @@ def webhook():
             notify_boss(customer_name, user_message, time_str)
             continue
 
+        # ----- 5. AI 回覆 + 見證卡片觸發 -----
         try:
             ai_response = ask_claude(user_message)
             reply_to_user(reply_token, ai_response)
-        except:
+
+            # 追蹤互動次數，第 3 次後推送見證卡片
+            user_message_count[user_id] = user_message_count.get(user_id, 0) + 1
+            if user_message_count[user_id] == 3 and user_id not in testimonial_sent:
+                testimonial_sent.add(user_id)
+                timer = threading.Timer(3.0, push_flex, args=[user_id, build_testimonial_flex()])
+                timer.daemon = True
+                timer.start()
+
+        except Exception as e:
+            log_msg = f"[ERROR] Claude API: {str(e)}"
+            print(log_msg, flush=True)
+            app_logs.append({"time": datetime.now().strftime("%m/%d %H:%M:%S"), "msg": log_msg})
             reply_to_user(reply_token, "抱歉，系統暫時忙碌中，請稍後再試或直接聯繫我們 🙏")
 
     return jsonify({"status": "ok"})
