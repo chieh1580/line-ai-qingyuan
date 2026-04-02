@@ -1110,9 +1110,179 @@ def debug_logs():
     return jsonify(app_logs[-50:])
 
 
+# ===== Rich Menu 設定 =====
+@app.route("/setup-richmenu")
+def setup_richmenu():
+    """一次性設定：建立 Rich Menu + 產生底圖 + 上傳 + 設為預設"""
+    if request.cookies.get("admin_auth") != ADMIN_PASSWORD:
+        return jsonify({"error": "unauthorized"}), 401
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return jsonify({"error": "Pillow not installed"}), 500
+
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
+
+    # Step 1: 刪除舊的預設 Rich Menu
+    try:
+        old = requests.get("https://api.line.me/v2/bot/user/all/richmenu", headers=headers, timeout=10)
+        if old.status_code == 200:
+            old_id = old.json().get("richMenuId")
+            if old_id:
+                requests.delete(f"https://api.line.me/v2/bot/richmenu/{old_id}", headers=headers, timeout=10)
+    except Exception:
+        pass
+
+    admin_url = ADMIN_URL or "https://line-ai-qingyuan-production.up.railway.app/admin"
+
+    # Step 2: 建立 Rich Menu 物件（6 格）
+    richmenu_data = {
+        "size": {"width": 2500, "height": 1686},
+        "selected": True,
+        "name": "勤源青崧居選單",
+        "chatBarText": "📋 點我展開選單",
+        "areas": [
+            {"bounds": {"x": 0, "y": 0, "width": 833, "height": 843},
+             "action": {"type": "message", "text": "你們有哪些房型？價格怎麼算？"}},
+            {"bounds": {"x": 833, "y": 0, "width": 834, "height": 843},
+             "action": {"type": "message", "text": "這個建案的地段有什麼優勢？"}},
+            {"bounds": {"x": 1667, "y": 0, "width": 833, "height": 843},
+             "action": {"type": "message", "text": "投資報酬率大概多少？適合投資嗎？"}},
+            {"bounds": {"x": 0, "y": 843, "width": 833, "height": 843},
+             "action": {"type": "message", "text": "我想預約看屋"}},
+            {"bounds": {"x": 833, "y": 843, "width": 834, "height": 843},
+             "action": {"type": "message", "text": "找真人"}},
+            {"bounds": {"x": 1667, "y": 843, "width": 833, "height": 843},
+             "action": {"type": "message", "text": "選單"}}
+        ]
+    }
+
+    r = requests.post("https://api.line.me/v2/bot/richmenu", headers=headers, json=richmenu_data, timeout=10)
+    if r.status_code != 200:
+        return jsonify({"error": "create richmenu failed", "detail": r.text}), 500
+    richmenu_id = r.json()["richMenuId"]
+
+    # Step 3: 用 PIL 產生底圖
+    W, H = 2500, 1686
+    cell_w, cell_h = 833, 843
+    GAP = 6
+
+    FONT_CANDIDATES = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "NotoSansTC-Regular.otf"),
+        "/app/NotoSansTC-Regular.otf",
+        "NotoSansTC-Regular.otf",
+        "C:/Windows/Fonts/msjh.ttc",
+    ]
+
+    def _load_font(size):
+        for fp in FONT_CANDIDATES:
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    font_title = _load_font(88)
+    font_sub = _load_font(44)
+    font_icon = _load_font(72)
+
+    cells = [
+        {"bg1": "#1a3a2a", "bg2": "#0d2818", "accent": "#4caf50", "icon": "🏠", "title": "房型與價格", "sub": "單套360萬 雙套660萬"},
+        {"bg1": "#1a3a2a", "bg2": "#163020", "accent": "#4caf50", "icon": "📍", "title": "地段優勢", "sub": "804醫院走路3分鐘"},
+        {"bg1": "#1a3a2a", "bg2": "#0d2818", "accent": "#4caf50", "icon": "💰", "title": "投資報酬", "sub": "年報酬率3%起"},
+        {"bg1": "#8b2500", "bg2": "#6d1d00", "accent": "#ff6b35", "icon": "📅", "title": "預約看屋", "sub": "專人為您安排賞屋"},
+        {"bg1": "#2a2a3a", "bg2": "#1a1a2e", "accent": "#78909c", "icon": "👩", "title": "聯繫專人", "sub": "真人客服為您服務"},
+        {"bg1": "#2a2a3a", "bg2": "#1a1a2e", "accent": "#00b4d8", "icon": "📋", "title": "主選單", "sub": "查看所有功能"},
+    ]
+
+    img = Image.new("RGB", (W, H), "#0a0a14")
+    draw = ImageDraw.Draw(img)
+
+    for i, cell in enumerate(cells):
+        col = i % 3
+        row = i // 3
+        x = col * cell_w + (GAP if col > 0 else 0)
+        y = row * cell_h + (GAP if row > 0 else 0)
+        w = cell_w - (GAP if col < 2 else 0)
+        h = cell_h - (GAP if row < 1 else 0)
+
+        # 漸層背景
+        steps = 20
+        r1, g1, b1 = int(cell["bg1"][1:3], 16), int(cell["bg1"][3:5], 16), int(cell["bg1"][5:7], 16)
+        r2, g2, b2 = int(cell["bg2"][1:3], 16), int(cell["bg2"][3:5], 16), int(cell["bg2"][5:7], 16)
+        for s in range(steps):
+            t = s / steps
+            cr = int(r1 + (r2 - r1) * t)
+            cg = int(g1 + (g2 - g1) * t)
+            cb = int(b1 + (b2 - b1) * t)
+            sy = y + int(h * s / steps)
+            ey = y + int(h * (s + 1) / steps)
+            draw.rectangle([x, sy, x + w, ey], fill=f"#{cr:02x}{cg:02x}{cb:02x}")
+
+        # 底部 accent 線條
+        accent = cell["accent"]
+        draw.rectangle([x, y + h - 6, x + w, y + h], fill=accent)
+
+        # 圖標
+        cx = x + w // 2
+        try:
+            ib = draw.textbbox((0, 0), cell["icon"], font=font_icon)
+            iw = ib[2] - ib[0]
+            draw.text((cx - iw // 2, y + h // 2 - 180), cell["icon"], fill="#ffffff", font=font_icon)
+        except Exception:
+            pass
+
+        # 主標題
+        try:
+            tb = draw.textbbox((0, 0), cell["title"], font=font_title)
+            tw = tb[2] - tb[0]
+            title_y = y + h // 2 - 20
+            draw.text((cx - tw // 2, title_y), cell["title"], fill="#ffffff", font=font_title)
+        except Exception:
+            pass
+
+        # 副標題
+        try:
+            sb = draw.textbbox((0, 0), cell["sub"], font=font_sub)
+            sw = sb[2] - sb[0]
+            sub_y = y + h // 2 + 90
+            draw.text((cx - sw // 2, sub_y), cell["sub"], fill="#aaaaaa", font=font_sub)
+        except Exception:
+            pass
+
+    # 頂部品牌 bar
+    draw.rectangle([0, 0, W, 4], fill="#4caf50")
+
+    import io
+    img_bytes = io.BytesIO()
+    img.save(img_bytes, format="PNG")
+    img_bytes.seek(0)
+
+    # Step 4: 上傳圖片
+    r2 = requests.post(
+        f"https://api-data.line.me/v2/bot/richmenu/{richmenu_id}/content",
+        headers={"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "image/png"},
+        data=img_bytes.read(), timeout=30
+    )
+    if r2.status_code != 200:
+        return jsonify({"error": "upload image failed", "detail": r2.text}), 500
+
+    # Step 5: 設為預設
+    r3 = requests.post(
+        f"https://api.line.me/v2/bot/user/all/richmenu/{richmenu_id}",
+        headers={"Authorization": f"Bearer {LINE_TOKEN}"},
+        timeout=10
+    )
+    if r3.status_code != 200:
+        return jsonify({"error": "set default failed", "detail": r3.text}), 500
+
+    return jsonify({"status": "ok", "richMenuId": richmenu_id, "message": "Rich Menu 建立完成！"})
+
+
 @app.route("/")
 def health():
-    return "LINE AI 客服系統運作中 ✅ v2.0-guided"
+    return "LINE AI 客服系統運作中 ✅ v2.1"
 
 
 if __name__ == "__main__":
