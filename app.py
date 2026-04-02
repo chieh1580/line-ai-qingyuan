@@ -950,18 +950,22 @@ def webhook():
             reply_messages(reply_token, [build_booking_start_flex()])
             continue
 
-        # ----- 4. 檢查：暫停中的用戶 -----
-        if user_id in paused_users:
-            continue
-
-        # ----- 5. 檢查：找真人（暫停 AI） -----
+        # ----- 4. 檢查：找真人（暫停 AI + 通知老闆） -----
         current_triggers = json.loads(get_setting('trigger_words', json.dumps(TRIGGER_WORDS)))
         if any(word in user_message for word in current_triggers):
+            # 老闆自己不觸發轉人工
+            if user_id == BOSS_USER_ID:
+                reply_to_user(reply_token, "老闆您好！這是轉人工功能，客人觸發時您會收到通知 😊")
+                continue
             paused_users.add(user_id)
             reply_to_user(reply_token, "好的！我馬上幫您通知專人，請稍候片刻，我們會盡快與您聯繫 🙏")
             customer_name = user_profiles[user_id]["name"]
             time_str = user_profiles[user_id]["lastTime"]
             notify_boss(customer_name, user_message, time_str)
+            continue
+
+        # ----- 5. 檢查：暫停中的用戶 -----
+        if user_id in paused_users:
             continue
 
         # ----- 6. AI 回覆 + 見證卡片觸發 -----
