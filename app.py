@@ -35,6 +35,7 @@ user_state = {}           # userId -> {"flow": "collecting_booking", "step": "na
 user_booking_data = {}    # userId -> {"name": ..., "phone": ..., "time": ...}
 user_message_count = {}   # userId -> int (追蹤互動次數，用於觸發見證卡片)
 testimonial_sent = set()  # 已發送見證卡片的用戶
+welcome_sent = set()      # 已發送歡迎卡片的用戶
 
 TRIGGER_WORDS = ["找真人","找人工","找客服","找專員","真人","人工"]
 BOOKING_KEYWORDS = ["我要預約", "我想預約", "預約看屋", "我要看房", "我想看房", "預約賞屋", "我想預約看屋"]
@@ -817,6 +818,7 @@ def webhook():
                 "lastTime": datetime.now().strftime("%m/%d %H:%M")
             }
 
+            welcome_sent.add(user_id)
             reply_messages(reply_token, [build_welcome_flex()])
             schedule_followups(user_id)
             continue
@@ -846,6 +848,12 @@ def webhook():
         else:
             user_profiles[user_id]["lastMessage"] = user_message
             user_profiles[user_id]["lastTime"] = datetime.now().strftime("%m/%d %H:%M")
+
+        # ----- 0. 舊用戶第一次互動，補發歡迎卡片 -----
+        if user_id not in welcome_sent:
+            welcome_sent.add(user_id)
+            reply_messages(reply_token, [build_welcome_flex()])
+            continue
 
         # ----- 1. 檢查：是否在預約看屋資料收集流程中 -----
         if user_id in user_state and user_state[user_id].get("flow") == "collecting_booking":
