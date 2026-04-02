@@ -1083,7 +1083,7 @@ def debug_logs():
 
 @app.route("/")
 def health():
-    return "LINE AI 客服系統運作中 ✅"
+    return "LINE AI 客服系統運作中 ✅ v2.0-guided"
 
 
 if __name__ == "__main__":
