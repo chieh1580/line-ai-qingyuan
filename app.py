@@ -643,6 +643,100 @@ def send_followup(user_id, msg_type):
         app_logs.append({"time": datetime.now().strftime("%m/%d %H:%M:%S"), "msg": log_msg})
 
 
+# ===== 按鈕引導卡片 =====
+GUIDED_BUTTONS = {
+    "你們有哪些房型？價格怎麼算？": {
+        "title": "🏠 房型與價格",
+        "info": [
+            "【單套房】360 萬｜9.47 坪",
+            "　一房一衛一陽台，剩 2 戶",
+            "　首購貸 7 成，自備約 110 萬",
+            "　月繳約 15,000 元",
+            "",
+            "【雙套房】660 萬｜18～20 坪",
+            "　兩房兩廳兩衛浴兩陽台，剩 4 戶",
+            "　首購貸 7 成，自備約 185 萬",
+            "　軍職可申請優惠貸款",
+            "",
+            "✨ 全部含精美裝潢、家具、變頻冷暖空調",
+        ]
+    },
+    "這個建案的地段有什麼優勢？": {
+        "title": "📍 地段優勢",
+        "info": [
+            "🏥 步行 3 分鐘 → 國軍桃園總醫院（804）",
+            "　醫護、軍官租屋剛性需求",
+            "",
+            "🛒 步行 5 分鐘 → 中興路商圈",
+            "　全聯、寶雅、錢都、郵局、超商",
+            "",
+            "🚗 車程 10 分鐘 → 國道 3 號龍潭交流道",
+            "　南往竹科、北往三峽",
+            "",
+            "📌 地址：桃園市龍潭區中興路187巷1弄35號",
+        ]
+    },
+    "投資報酬率大概多少？適合投資嗎？": {
+        "title": "💰 投資亮點",
+        "info": [
+            "📈 年報酬率 3% 起",
+            "🛡️ 抗通膨保值投資",
+            "🔑 即買即收租，買完馬上出租",
+            "👨‍⚕️ 租客以醫護、軍官為主，品質穩定",
+            "🏢 代租代管諮詢，輕鬆當房東",
+            "",
+            "💡 單套房月租約 9,000～10,000 元",
+            "　月繳房貸約 15,000 元",
+            "　租金 cover 大部分，等於租客幫你繳房貸！",
+        ]
+    },
+}
+
+
+def build_guided_flex(user_message):
+    """按鈕引導卡片 — 結構化資訊 + 下一步按鈕"""
+    config = GUIDED_BUTTONS[user_message]
+    info_text = "\n".join(config["info"])
+
+    # 其他兩個按鈕（排除當前已選的）
+    other_buttons = []
+    button_map = {
+        "你們有哪些房型？價格怎麼算？": ("🏠 房型與價格", "#1a5c2e"),
+        "這個建案的地段有什麼優勢？": ("📍 地段優勢", "#2e7d4a"),
+        "投資報酬率大概多少？適合投資嗎？": ("💰 投資報酬", "#3d8b5e"),
+    }
+    for text, (label, color) in button_map.items():
+        if text != user_message:
+            other_buttons.append(
+                {"type": "button", "action": {"type": "message", "label": label, "text": text}, "style": "secondary", "height": "sm"}
+            )
+
+    return {
+        "type": "flex",
+        "altText": config["title"],
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "contents": [{"type": "text", "text": config["title"], "weight": "bold", "size": "lg", "color": "#1a5c2e"}],
+                "paddingAll": "16px", "backgroundColor": "#f0f7f2"
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": info_text, "wrap": True, "size": "sm", "color": "#555555"},
+                    {"type": "separator", "margin": "lg"},
+                    {"type": "text", "text": "👇 繼續了解", "weight": "bold", "size": "sm", "margin": "lg", "color": "#2d1f14"},
+                    {"type": "box", "layout": "vertical", "margin": "md", "spacing": "sm", "contents": other_buttons + [
+                        {"type": "button", "action": {"type": "message", "label": "📅 預約看屋", "text": "我想預約看屋"}, "style": "primary", "color": "#c8401a", "height": "sm"}
+                    ]}
+                ],
+                "paddingAll": "16px"
+            }
+        }
+    }
+
+
 def notify_boss_booking(customer_name, name, phone, preferred_time):
     """通知老闆：新的預約看屋"""
     time_str = datetime.now().strftime("%m/%d %H:%M")
@@ -807,18 +901,23 @@ def webhook():
                 reply_messages(reply_token, [build_booking_complete_flex(data)])
                 continue
 
-        # ----- 2. 檢查：預約看屋關鍵字 -----
+        # ----- 2. 檢查：按鈕引導（房型/地段/投資） -----
+        if user_message in GUIDED_BUTTONS:
+            reply_messages(reply_token, [build_guided_flex(user_message)])
+            continue
+
+        # ----- 3. 檢查：預約看屋關鍵字 -----
         if any(kw in user_message for kw in BOOKING_KEYWORDS):
             user_state[user_id] = {"flow": "collecting_booking", "step": "name"}
             user_booking_data[user_id] = {}
             reply_messages(reply_token, [build_booking_start_flex()])
             continue
 
-        # ----- 3. 檢查：暫停中的用戶 -----
+        # ----- 4. 檢查：暫停中的用戶 -----
         if user_id in paused_users:
             continue
 
-        # ----- 4. 檢查：找真人（暫停 AI） -----
+        # ----- 5. 檢查：找真人（暫停 AI） -----
         current_triggers = json.loads(get_setting('trigger_words', json.dumps(TRIGGER_WORDS)))
         if any(word in user_message for word in current_triggers):
             paused_users.add(user_id)
@@ -828,7 +927,7 @@ def webhook():
             notify_boss(customer_name, user_message, time_str)
             continue
 
-        # ----- 5. AI 回覆 + 見證卡片觸發 -----
+        # ----- 6. AI 回覆 + 見證卡片觸發 -----
         try:
             ai_response = ask_claude(user_message)
             reply_to_user(reply_token, ai_response)
